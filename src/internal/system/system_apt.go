@@ -10,6 +10,7 @@ package system
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -200,8 +201,84 @@ func QueryPackageDownloadSize(updateType UpdateType, packages ...string) (float6
 	return *downloadSize, *allPackageSize, nil
 }
 
+// buildAndRunDownloadSizeCmd 根据 path 构建 apt-get dist-upgrade 命令并执行，解析输出中的包下载大小信息。
+// 返回：需要下载的大小、所有包的总大小、错误。
+func buildAndRunDownloadSizeCmd(path string, updateType UpdateType, pkgList []string) (float64, float64, error) {
+	var cmd *exec.Cmd
+	if utils2.IsDir(path) {
+		// #nosec G204
+		cmd = exec.Command("/usr/bin/apt-get",
+			append([]string{"dist-upgrade", "-d", "-o", "Debug::NoLocking=1", "-c", LastoreAptV2CommonConfPath, "--assume-no",
+				"-o", fmt.Sprintf("%v=%v", "Dir::Etc::sourcelist", "/dev/null"),
+				"-o", fmt.Sprintf("%v=%v", "Dir::Etc::SourceParts", path)}, pkgList...)...)
+	} else {
+		// #nosec G204
+		cmd = exec.Command("/usr/bin/apt-get",
+			append([]string{"dist-upgrade", "-d", "-o", "Debug::NoLocking=1", "-c", LastoreAptV2CommonConfPath, "--assume-no",
+				"-o", fmt.Sprintf("%v=%v", "Dir::Etc::sourcelist", path),
+				"-o", fmt.Sprintf("%v=%v", "Dir::Etc::SourceParts", "/dev/null")}, pkgList...)...)
+	}
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	logger.Infof("%v download size cmd: %v", updateType.JobType(), cmd.String())
+	lines, err := utils.FilterExecOutput(cmd, time.Second*120, func(line string) bool {
+		_, _, _err := parsePackageSize(line)
+		return _err == nil
+	})
+	if err != nil && len(lines) == 0 {
+		return 0, 0, fmt.Errorf("run:%v failed-->%v", cmd.Args, err)
+	}
+	if len(lines) != 0 {
+		needDownloadSize, allSize, err := parsePackageSize(lines[0])
+		if err != nil {
+			logger.Warning(err)
+			return 0, 0, err
+		}
+		return needDownloadSize, allSize, nil
+	}
+	return 0, 0, nil
+}
+
+// dicUpgradeCheckOutput 对应 deepin-immutable-ctl upgrade check -j 的输出结构
+type dicUpgradeCheckOutput struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		TotalSize int64 `json:"totalSize"`
+	} `json:"data"`
+}
+
+func buildAndRunDownloadSizeCmdViaDIC(path string, updateType UpdateType, pkgList []string) (float64, float64, error) {
+	var sourceArgs string
+	cmd := exec.Command(DeepinImmutableCtlPath, "upgrade", "check", "-j")
+	if path != "" {
+		if utils2.IsDir(path) {
+			sourceArgs = "-o Dir::Etc::sourcelist=/dev/null -o Dir::Etc::SourceParts=" + path
+		} else {
+			sourceArgs = "-o Dir::Etc::sourcelist=" + path + " -o Dir::Etc::SourceParts=/dev/null"
+		}
+	}
+	cmd.Env = append(os.Environ(), "LC_ALL=C",
+		"DEEPIN_IMMUTABLE_UPGRADE_APT_OPTION="+sourceArgs)
+	logger.Infof("%v download size cmd (DIC): %v", updateType.JobType(), cmd.String())
+	out, err := cmd.Output()
+	logger.Debugf("DIC upgrade check output: %s", out)
+	if err != nil {
+		return 0, 0, fmt.Errorf("run %v failed: %v", cmd.Args, err)
+	}
+	var result dicUpgradeCheckOutput
+	if err := json.Unmarshal(out, &result); err != nil {
+		return 0, 0, fmt.Errorf("parse DIC output failed: %v", err)
+	}
+	if result.Code != 0 {
+		return 0, 0, fmt.Errorf("DIC upgrade check returned code %d: %s", result.Code, result.Message)
+	}
+	// TODO
+	return float64(result.Data.TotalSize), float64(result.Data.TotalSize), nil
+}
+
 // QuerySourceDownloadSize 根据更新类型(仓库),获取需要的下载量,return arg0:需要下载的量;arg1:所有包的大小;arg2:error
 func QuerySourceDownloadSize(updateType UpdateType, pkgList []string) (float64, float64, error) {
+	logger.Debugf("QuerySourceDownloadSize updateType: %v, pkgList: %v", updateType, pkgList)
 	startTime := time.Now()
 	downloadSize := new(float64)
 	allPackageSize := new(float64)
@@ -211,39 +288,16 @@ func QuerySourceDownloadSize(updateType UpdateType, pkgList []string) (float64, 
 				unref()
 			}
 		}()
-		var cmd *exec.Cmd
-		if utils2.IsDir(path) {
-			// #nosec G204
-			cmd = exec.Command("/usr/bin/apt-get",
-				append([]string{"dist-upgrade", "-d", "-o", "Debug::NoLocking=1", "-c", LastoreAptV2CommonConfPath, "--assume-no",
-					"-o", fmt.Sprintf("%v=%v", "Dir::Etc::sourcelist", "/dev/null"),
-					"-o", fmt.Sprintf("%v=%v", "Dir::Etc::SourceParts", path)}, pkgList...)...)
-		} else {
-			// #nosec G204
-			cmd = exec.Command("/usr/bin/apt-get",
-				append([]string{"dist-upgrade", "-d", "-o", "Debug::NoLocking=1", "-c", LastoreAptV2CommonConfPath, "--assume-no",
-					"-o", fmt.Sprintf("%v=%v", "Dir::Etc::sourcelist", path),
-					"-o", fmt.Sprintf("%v=%v", "Dir::Etc::SourceParts", "/dev/null")}, pkgList...)...)
+		runFn := buildAndRunDownloadSizeCmd
+		if IncrementalUpdate {
+			runFn = buildAndRunDownloadSizeCmdViaDIC
 		}
-		cmd.Env = append(os.Environ(), "LC_ALL=C")
-		logger.Infof("%v download size cmd: %v", updateType.JobType(), cmd.String())
-		lines, err := utils.FilterExecOutput(cmd, time.Second*120, func(line string) bool {
-			_, _, _err := parsePackageSize(line)
-			return _err == nil
-		})
-		if err != nil && len(lines) == 0 {
-			return fmt.Errorf("run:%v failed-->%v", cmd.Args, err)
+		needDownloadSize, allSize, err := runFn(path, updateType, pkgList)
+		if err != nil {
+			return err
 		}
-
-		if len(lines) != 0 {
-			needDownloadSize, allSize, err := parsePackageSize(lines[0])
-			if err != nil {
-				logger.Warning(err)
-				return err
-			}
-			*downloadSize = needDownloadSize
-			*allPackageSize = allSize
-		}
+		*downloadSize = needDownloadSize
+		*allPackageSize = allSize
 		return nil
 	})
 	if err != nil {
@@ -251,6 +305,7 @@ func QuerySourceDownloadSize(updateType UpdateType, pkgList []string) (float64, 
 		return SizeDownloaded, SizeDownloaded, err
 	}
 	logger.Debug("end QuerySourceDownloadSize duration:", time.Now().Sub(startTime))
+	logger.Debugf("QuerySourceDownloadSize result, download size: %v, all package size: %v", *downloadSize, *allPackageSize)
 	return *downloadSize, *allPackageSize, nil
 }
 
@@ -329,7 +384,7 @@ func QuerySourceAddSize(updateType UpdateType) (float64, error) {
 		logger.Warning(err)
 		return SizeUnknown, err
 	}
-	logger.Debug("end QuerySourceDownloadSize duration:", time.Now().Sub(startTime))
+	logger.Debug("end QuerySourceAddSize duration:", time.Now().Sub(startTime))
 	return *addSize, nil
 }
 
