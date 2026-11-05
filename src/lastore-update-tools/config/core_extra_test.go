@@ -171,3 +171,103 @@ func TestCoreConfigLoaderCfgCacheCacheError(t *testing.T) {
 	err := cc.LoaderCfgCache(cfgPath, &cacheCfg)
 	assert.Error(t, err)
 }
+
+func TestLoadOrCreateCfgMissing(t *testing.T) {
+	for _, name := range []string{"config.yaml", "missing/nested/config.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name)
+			cfg := CoreConfig{Base: "/stale", DebugMode: true, ApiVersion: "stale"}
+			require.NoError(t, cfg.LoadOrCreateCfg(path))
+			expected := CoreConfig{CacheList: "caches.yaml", Base: "/var/lib/lastore/check/", DynHookTimeout: 1800}
+			assert.Equal(t, expected, cfg)
+			var loaded CoreConfig
+			require.NoError(t, loaded.LoaderCfg(path))
+			assert.Equal(t, expected, loaded)
+			// Keep runtime defaults aligned with the configuration installed by packaging.
+			data, err := os.ReadFile("../../../configs/config.yaml")
+			require.NoError(t, err)
+			var packaged CoreConfig
+			require.NoError(t, yaml.Unmarshal(data, &packaged))
+			assert.Equal(t, packaged, cfg)
+		})
+	}
+}
+
+func TestLoadOrCreateCfgPreservesExisting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte("# custom configuration\nBase: /custom\nDynHookTimeout: 42\nDebugMode: true\n")
+	require.NoError(t, os.WriteFile(path, data, 0644))
+	for i := 0; i < 2; i++ {
+		var cfg CoreConfig
+		require.NoError(t, cfg.LoadOrCreateCfg(path))
+		assert.Equal(t, "/custom", cfg.Base)
+		assert.Equal(t, 42, cfg.DynHookTimeout)
+		assert.True(t, cfg.DebugMode)
+		got, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, data, got)
+	}
+}
+
+func TestLoadOrCreateCfgErrors(t *testing.T) {
+	t.Run("invalid yaml", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		data := []byte("Base: [invalid")
+		require.NoError(t, os.WriteFile(path, data, 0644))
+		var cfg CoreConfig
+		require.Error(t, cfg.LoadOrCreateCfg(path))
+		got, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, data, got)
+	})
+	t.Run("directory", func(t *testing.T) {
+		var cfg CoreConfig
+		require.Error(t, cfg.LoadOrCreateCfg(t.TempDir()))
+	})
+	t.Run("parent is file", func(t *testing.T) {
+		parent := filepath.Join(t.TempDir(), "parent")
+		require.NoError(t, os.WriteFile(parent, []byte("unchanged"), 0644))
+		var cfg CoreConfig
+		require.Error(t, cfg.LoadOrCreateCfg(filepath.Join(parent, "config.yaml")))
+	})
+	t.Run("permission denied", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
+		dir := t.TempDir()
+		require.NoError(t, os.Chmod(dir, 0500))
+		t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+		var cfg CoreConfig
+		require.Error(t, cfg.LoadOrCreateCfg(filepath.Join(dir, "config.yaml")))
+	})
+}
+
+func TestLoaderCfgFillsImportantFields(t *testing.T) {
+	for _, data := range []string{"{}", "Base: ''\nCacheList: ''\nDynHookTimeout: 0\n", "DynHookTimeout: -1\n"} {
+		t.Run(data, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(data), 0644))
+			cfg := CoreConfig{Base: "/stale", CacheList: "stale", DebugMode: true, ApiVersion: "stale", DynHookTimeout: 60}
+			require.NoError(t, cfg.LoaderCfg(path))
+			assert.Equal(t, defaultCoreConfig(), cfg)
+			got, err := os.ReadFile(path)
+			require.NoError(t, err)
+			assert.Equal(t, data, string(got))
+		})
+	}
+}
+
+func TestLoaderCfgReloadAndParseFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("Base: /custom\nCacheList: custom.yaml\nDebugMode: true\nApiVersion: custom\nDynHookTimeout: 42\n"), 0644))
+	var cfg CoreConfig
+	require.NoError(t, cfg.LoaderCfg(path))
+	assert.Equal(t, CoreConfig{Base: "/custom", CacheList: "custom.yaml", DebugMode: true, ApiVersion: "custom", DynHookTimeout: 42}, cfg)
+	require.NoError(t, os.WriteFile(path, []byte("{}"), 0644))
+	require.NoError(t, cfg.LoaderCfg(path))
+	assert.Equal(t, defaultCoreConfig(), cfg)
+	before := cfg
+	require.NoError(t, os.WriteFile(path, []byte("Base: /changed\nDynHookTimeout: invalid\n"), 0644))
+	require.Error(t, cfg.LoaderCfg(path))
+	assert.Equal(t, before, cfg)
+}

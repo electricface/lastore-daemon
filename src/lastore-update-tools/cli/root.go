@@ -6,6 +6,7 @@ package coremodules
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/linuxdeepin/lastore-daemon/src/internal/system"
 	"github.com/linuxdeepin/lastore-daemon/src/lastore-update-tools/config"
@@ -35,13 +36,17 @@ func (e *Error) Error() string {
 func initCheckEnv() error {
 	logger.Debugf("initialize check environment")
 	logger.Debugf("load config")
-	if err := RootCoreConfig.LoaderCfg(ConfigCfg); err != nil {
+	_, statErr := os.Stat(ConfigCfg)
+	if err := RootCoreConfig.LoadOrCreateCfg(ConfigCfg); err != nil {
 		logger.Errorf("load config failed:%v", err)
 		return &system.JobError{
 			ErrType:      system.ErrorCheckMetaInfoFile,
 			ErrDetail:    fmt.Sprintf("load config failed:%v", err),
 			IsCheckError: true,
 		}
+	}
+	if os.IsNotExist(statErr) {
+		logger.Infof("restored missing check config: %s", ConfigCfg)
 	}
 
 	check.SetDynHookTimeout(RootCoreConfig.DynHookTimeout)

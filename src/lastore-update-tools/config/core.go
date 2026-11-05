@@ -4,18 +4,65 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 
 	"github.com/linuxdeepin/lastore-daemon/src/lastore-update-tools/config/cache"
 	"github.com/linuxdeepin/lastore-daemon/src/lastore-update-tools/pkg/utils/fs"
 	"gopkg.in/yaml.v2"
 )
 
+// DefaultDynHookTimeout is the fallback hook timeout in seconds.
+const DefaultDynHookTimeout = 1800
+
+// CoreConfig holds the upgrade check configuration. yaml.v2 does not interpret
+// default tags; defaults are defined in defaultCoreConfig and applied by LoaderCfg.
 type CoreConfig struct {
-	CacheList      string `json:"CacheList" yaml:"CacheList"`                          // cachelist
-	Base           string `json:"Base" yaml:"Base"`                                    // work base
-	DebugMode      bool   `json:"DebugMode" yaml:"DebugMode" default:"false"`          // Debug Mode
-	ApiVersion     string `json:"ApiVersion" yaml:"ApiVersion" default:"1.0"`          // ApiVersion
-	DynHookTimeout int    `json:"DynHookTimeout" yaml:"DynHookTimeout" default:"1800"` // dyn hook timeout in seconds
+	CacheList      string `json:"CacheList" yaml:"CacheList"`           // cachelist
+	Base           string `json:"Base" yaml:"Base"`                     // work base
+	DebugMode      bool   `json:"DebugMode" yaml:"DebugMode"`           // Debug Mode
+	ApiVersion     string `json:"ApiVersion" yaml:"ApiVersion"`         // ApiVersion
+	DynHookTimeout int    `json:"DynHookTimeout" yaml:"DynHookTimeout"` // dyn hook timeout in seconds
+}
+
+func defaultCoreConfig() CoreConfig {
+	return CoreConfig{
+		CacheList:      "caches.yaml",
+		Base:           "/var/lib/lastore/check/",
+		DebugMode:      false,
+		DynHookTimeout: DefaultDynHookTimeout,
+	}
+}
+
+// LoadOrCreateCfg restores a missing configuration without replacing existing files.
+func (ts *CoreConfig) LoadOrCreateCfg(path string) error {
+	if err := ts.LoaderCfg(path); !os.IsNotExist(err) {
+		return err
+	}
+	defaults := defaultCoreConfig()
+	output, err := yaml.Marshal(&defaults)
+	if err != nil {
+		return fmt.Errorf("marshal default config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
+	if os.IsExist(err) {
+		return ts.LoaderCfg(path)
+	}
+	if err != nil {
+		return fmt.Errorf("create default config: %w", err)
+	}
+	_, writeErr := file.Write(output)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return fmt.Errorf("write default config: %w", writeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close default config: %w", closeErr)
+	}
+	*ts = defaults
+	return nil
 }
 
 func (ts *CoreConfig) LoaderCfg(path string) error {
@@ -27,9 +74,21 @@ func (ts *CoreConfig) LoaderCfg(path string) error {
 	if err != nil {
 		return fmt.Errorf("loader/config read config failed: %v", err)
 	}
-	if err := yaml.Unmarshal(cfgRaw, &ts); err != nil {
+	var loaded CoreConfig
+	if err := yaml.Unmarshal(cfgRaw, &loaded); err != nil {
 		return fmt.Errorf("loader/config copy config failed: %v", err)
 	}
+	defaults := defaultCoreConfig()
+	if loaded.Base == "" {
+		loaded.Base = defaults.Base
+	}
+	if loaded.CacheList == "" {
+		loaded.CacheList = defaults.CacheList
+	}
+	if loaded.DynHookTimeout <= 0 {
+		loaded.DynHookTimeout = defaults.DynHookTimeout
+	}
+	*ts = loaded
 	return nil
 }
 
